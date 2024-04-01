@@ -1,20 +1,26 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
+	"log"
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/streadway/amqp"
 )
 
 var username string
 
 func init() {
-	// флаг через который мы передаем имя пользователя
 	flag.StringVar(&username, "u", "anonymous", "-u username")
 	flag.Parse()
 }
@@ -32,7 +38,6 @@ func main() {
 		),
 	)
 
-	// создаем подключение
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5672/")
 	if err != nil {
 		logger.Debug("amqp Dial", slog.Any("err", err))
@@ -41,7 +46,6 @@ func main() {
 
 	defer conn.Close()
 
-	// Создаем канал
 	amqpChannel, err := conn.Channel()
 	if err != nil {
 		logger.Error("conn Channel", slog.Any("err", err))
@@ -49,9 +53,8 @@ func main() {
 	}
 	defer amqpChannel.Close()
 
-	// декларируем уникальную очередь для клиента.
 	msgQ, err := amqpChannel.QueueDeclare(
-		"", // Имя генерируется автоматчиески
+		"",
 		false,
 		false,
 		true,
@@ -59,16 +62,14 @@ func main() {
 		nil,
 	)
 
-	// линкуем нашу очередь к точке обмена chat
 	err = amqpChannel.QueueBind(
 		msgQ.Name,
 		"",
-		"chat", // используем точку обмена chat
+		"chat",
 		false,
 		nil,
 	)
 
-	// создаем консьюмер для вычитки сообщений
 	msgCh, err := amqpChannel.Consume(
 		msgQ.Name,
 		"",
@@ -83,8 +84,6 @@ func main() {
 		return
 	}
 
-	_ = msgCh
-
 	type message struct {
 		ID       string `json:"id"`
 		Message  string `json:"body"`
@@ -92,5 +91,76 @@ func main() {
 		Ts       int64  `json:"ts"`
 	}
 
-	// вставьте код отправки и приема сообщий здесь
+	var id string
+	var mu sync.RWMutex
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case d := <-msgCh:
+				var m message
+				if err := json.Unmarshal(d.Body, &m); err != nil {
+					logger.Error("json Unmarshal", slog.Any("err", err))
+					continue
+				}
+				mu.RLock()
+				if m.ID == id {
+					mu.RUnlock()
+					continue
+				}
+				mu.RUnlock()
+
+				fmt.Printf("\r%s:> %s", m.Username, m.Message)
+				fmt.Printf("%s> ", username)
+			}
+		}
+	}()
+
+	reader := bufio.NewReader(os.Stdin)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		fmt.Printf("%s:> ", username)
+		msg, err := reader.ReadString('\n')
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		mu.Lock()
+		id = uuid.New().String()
+		mu.Unlock()
+
+		encoded, err := json.Marshal(
+			message{
+				ID:       id,
+				Message:  msg,
+				Username: username,
+				Ts:       time.Now().Unix(),
+			},
+		)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		err = amqpChannel.Publish(
+			"",
+			"msg_queue",
+			false,
+			false,
+			amqp.Publishing{
+				ContentType: "application/json",
+				Body:        encoded,
+			},
+		)
+		if err != nil {
+			logger.Error("amqp channel Publish", slog.Any("err", err))
+			continue
+		}
+	}
 }
